@@ -6,8 +6,14 @@ Reads an input CSV with rows like:
     UWp99568,ses-001,1526858
 (subject-id, session-id, etiv)
 
+Subject-id prefixes do NOT reliably tell you the site (e.g. "MGHL2p001" and
+"L3c001" can both live under the MGH site folder), so instead of guessing
+the site from the subject-id string, for each row we check every known
+site folder under --root and use whichever one actually contains
+sub-<subject-id> on disk.
+
 For each row:
-    - derives the site as the leading letters of subject-id (e.g. "UW" from "UWp99568")
+    - finds which <root>/<site>/sub-<subject-id> actually exists (tries all --sites)
     - builds the session directory: <root>/<site>/sub-<subject-id>/<session-id>
     - finds the DICOM scan date the same way generate_scan_dates_tsv.py does
       (first usable StudyDate/SeriesDate/AcquisitionDate/ContentDate tag,
@@ -29,7 +35,6 @@ Usage
 import argparse
 import csv
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -39,12 +44,6 @@ try:
 except ImportError:
     sys.exit("ERROR: pydicom is required. Install with: pip install pydicom --break-system-packages")
 
-
-# Leading UPPERCASE letters of subject-id = site, e.g. "UW" from "UWp99568".
-# Note: matching all leading letters (e.g. [A-Za-z]+) is wrong here -- the
-# "p" in "UWp99568" is a letter too and would get swallowed into the site
-# code, producing a bogus "UWp" site and MISSING_DIR for every row.
-SITE_RE = re.compile(r'^([A-Z]+)')
 
 # Checked in this order; first usable one wins.
 DATE_TAGS = ["StudyDate", "SeriesDate", "AcquisitionDate", "ContentDate"]
@@ -110,9 +109,15 @@ def find_scan_date(session_dir: Path, max_files: int) -> str | None:
     return None
 
 
-def derive_site(subject_id: str) -> str | None:
-    m = SITE_RE.match(subject_id)
-    return m.group(1) if m else None
+def find_subject_dir(root: Path, sites: list[str], subject_id: str) -> Path | None:
+    """Check each known site folder for sub-<subject_id> and return the
+    first one that actually exists on disk. Returns None if not found
+    under any site."""
+    for site in sites:
+        candidate = root / site / f"sub-{subject_id}"
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def main():
@@ -121,6 +126,9 @@ def main():
                      help="Input CSV with columns: subject-id, session-id, etiv (no header assumed)")
     ap.add_argument("--root", required=True, type=Path,
                      help="raw/mri root containing site subfolders (IU, UW, MSSM, MGH, ...)")
+    ap.add_argument("--sites", nargs="+", default=["IU", "UW", "MSSM", "MGH"],
+                     help="Site subfolder names to search under --root, in order tried, "
+                          "for each subject-id (default: IU UW MSSM MGH)")
     ap.add_argument("--output", required=True, type=Path, help="Output CSV path")
     ap.add_argument("--max-files-per-session", type=int, default=5,
                      help="Stop checking a session's files after this many attempts (default: 5)")
@@ -152,20 +160,17 @@ def main():
                 continue
             subject_id, session_id, etiv = row[0].strip(), row[1].strip(), row[2].strip()
 
-            site = derive_site(subject_id)
-            if not site:
-                print(f"[WARN] could not derive site from subject-id '{subject_id}', skipping", file=sys.stderr)
-                writer.writerow([subject_id, session_id, etiv, "NO_DATE"])
-                fout.flush()
-                continue
-
-            session_dir = args.root / site / f"sub-{subject_id}" / session_id
-
-            if not session_dir.is_dir():
+            subject_dir = find_subject_dir(args.root, args.sites, subject_id)
+            if subject_dir is None:
+                print(f"[WARN] sub-{subject_id} not found under any of {args.sites}", file=sys.stderr)
                 scan_date = "MISSING_DIR"
             else:
-                date = find_scan_date(session_dir, args.max_files_per_session)
-                scan_date = date if date else "NO_DATE"
+                session_dir = subject_dir / session_id
+                if not session_dir.is_dir():
+                    scan_date = "MISSING_DIR"
+                else:
+                    date = find_scan_date(session_dir, args.max_files_per_session)
+                    scan_date = date if date else "NO_DATE"
 
             print(f"[SCAN] {subject_id} {session_id} -> {scan_date}", file=sys.stderr)
             writer.writerow([subject_id, session_id, etiv, scan_date])
