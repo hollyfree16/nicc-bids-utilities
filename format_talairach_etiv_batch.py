@@ -70,15 +70,45 @@ def build_command(subject, t1w_path: Path, subj_dir: Path, csv_path: Path) -> st
         f"mri_convert --conform {t1w_path} orig.mgz",
         "mri_nu_correct.mni --i orig.mgz --o nu.mgz",
         "talairach_avi --i nu.mgz --xfm talairach.xfm",
-        f'echo "{subject},{ses_label},$(mri_segstats --etiv-only --talxfm talairach.xfm)" >> {csv_path}',
+        f'echo "{subject},{ses_label},$(mri_segstats --etiv-only --talxfm talairach.xfm | awk \'/atlas_icv/ {{print $4}}\')" >> {csv_path}',
     ]
 
     return f"mkdir -p {subj_dir} && (cd {subj_dir} && " + " && ".join(steps) + ")"
 
 
+def build_etiv_command(subject, ses_label, subj_dir: Path, csv_path: Path) -> str:
+    return (
+        f'(cd {subj_dir} && echo "{subject},{ses_label},'
+        f"$(mri_segstats --etiv-only --talxfm talairach.xfm | awk '/atlas_icv/ {{print $4}}')\""
+        f" >> {csv_path})"
+    )
+
+
+def find_existing_xfms(output_dir: Path, session: str = None):
+    """Find already-computed talairach.xfm files, grouped by session.
+
+    Returns a dict mapping session label ("ses-Y") -> list of (subject, subj_dir)
+    tuples, sorted by subject.
+    """
+    session_glob = normalize_session(session) if session else "ses-*"
+
+    xfms = defaultdict(list)
+    for xfm in sorted(output_dir.glob(f"{session_glob}/sub-*/talairach.xfm")):
+        subj_dir = xfm.parent
+        subject = subj_dir.name[len("sub-"):]
+        ses_label = subj_dir.parent.name
+        xfms[ses_label].append((subject, subj_dir))
+
+    for ses_label in xfms:
+        xfms[ses_label].sort(key=lambda x: x[0])
+
+    return xfms
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("bids_root", type=Path, help="Path to the BIDS dataset root")
+    parser.add_argument("bids_root", type=Path, nargs="?",
+                         help="Path to the BIDS dataset root (not needed with --etiv-only)")
     parser.add_argument("--output-dir", type=Path, required=True,
                          help="Base directory for per-subject working files "
                               "(orig.mgz, nu.mgz, talairach.xfm), e.g. /.../derivatives/talairach_etiv "
@@ -87,22 +117,44 @@ def main():
                          help="Directory to write <session>_talairach_etiv_queue.txt and "
                               "<session>_etiv.csv files to")
     parser.add_argument("--session", help="Restrict to a single session, e.g. --session 1 or --session ses-001")
+    parser.add_argument("--etiv-only", action="store_true",
+                         help="Skip the pipeline steps and just rebuild <session>_etiv.csv "
+                              "(and its queue file) from existing talairach.xfm files under --output-dir")
     args = parser.parse_args()
-
-    bids_root = args.bids_root.resolve()
-    if not bids_root.is_dir():
-        parser.error(f"{bids_root} is not a directory")
 
     output_dir = args.output_dir.resolve()
     queue_dir = args.queue_dir.resolve()
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.etiv_only:
+        subjects_by_session = find_existing_xfms(output_dir, args.session)
+        if not subjects_by_session:
+            scope = f" for {normalize_session(args.session)}" if args.session else ""
+            print(f"No talairach.xfm files found under {output_dir}{scope}")
+            return
+
+        for ses_label, subjects in sorted(subjects_by_session.items()):
+            queue_path = queue_dir / f"{ses_label}_etiv_regen_queue.txt"
+            csv_path = queue_dir / f"{ses_label}_etiv.csv"
+
+            csv_path.write_text(CSV_HEADER)
+
+            lines = [build_etiv_command(subject, ses_label, subj_dir, csv_path)
+                     for subject, subj_dir in subjects]
+
+            queue_path.write_text("\n".join(lines) + "\n")
+            print(f"[queue] {queue_path} ({len(lines)} command(s))")
+        return
+
+    bids_root = args.bids_root.resolve() if args.bids_root else None
+    if bids_root is None or not bids_root.is_dir():
+        parser.error("bids_root is required (and must be a directory) unless --etiv-only is set")
 
     images_by_session = find_t1w_images(bids_root, args.session)
     if not images_by_session:
         scope = f" for {normalize_session(args.session)}" if args.session else ""
         print(f"No T1w images found under {bids_root}{scope}")
         return
-
-    queue_dir.mkdir(parents=True, exist_ok=True)
 
     for ses_label, images in sorted(images_by_session.items()):
         queue_path = queue_dir / f"{ses_label}_talairach_etiv_queue.txt"
