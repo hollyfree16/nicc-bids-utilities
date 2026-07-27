@@ -40,8 +40,11 @@ except ImportError:
     sys.exit("ERROR: pydicom is required. Install with: pip install pydicom --break-system-packages")
 
 
-# Leading letters of subject-id = site, e.g. "UW" from "UWp99568"
-SITE_RE = re.compile(r'^([A-Za-z]+)')
+# Leading UPPERCASE letters of subject-id = site, e.g. "UW" from "UWp99568".
+# Note: matching all leading letters (e.g. [A-Za-z]+) is wrong here -- the
+# "p" in "UWp99568" is a letter too and would get swallowed into the site
+# code, producing a bogus "UWp" site and MISSING_DIR for every row.
+SITE_RE = re.compile(r'^([A-Z]+)')
 
 # Checked in this order; first usable one wins.
 DATE_TAGS = ["StudyDate", "SeriesDate", "AcquisitionDate", "ContentDate"]
