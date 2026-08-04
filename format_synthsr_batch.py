@@ -53,12 +53,11 @@ def find_t1w_images(bids_root: Path, session: str = None):
 
 
 def build_command(subject, ses_label, t1w_path: Path, output_path: Path) -> str:
-    synthsr_cmd = " ".join([
+    return " ".join([
         "mri_synthsr",
         "--i", str(t1w_path),
         "--o", str(output_path),
     ])
-    return f"mkdir -p {output_path.parent} && {synthsr_cmd}"
 
 
 def main():
