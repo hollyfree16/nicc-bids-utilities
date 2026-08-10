@@ -3,10 +3,11 @@
 Average multi-echo T1w images across a BIDS dataset using FreeSurfer's mri_average.
 
 Walks sub-*/ses-*/anat/ for files matching:
-    sub-<subject>_ses-<session>_echo-<n>_T1w.nii.gz
+    sub-<subject>_ses-<session>[_<other entities>]_echo-<n>_T1w.nii.gz
 
-and, for each subject/session found, runs:
-    mri_average -noconform -rms <echo files...> sub-<subject>_ses-<session>_T1w.nii.gz
+(e.g. "run-01" or other BIDS entities may appear between session and echo),
+and, for each subject/session/[other entities] combo found, runs:
+    mri_average -noconform -rms <echo files...> sub-<subject>_ses-<session>[_<other entities>]_T1w.nii.gz
 
 The number of echoes is auto-detected per session (not assumed to be 4), and
 sessions whose combined output already exists are skipped by default.
@@ -20,7 +21,8 @@ from collections import defaultdict
 from pathlib import Path
 
 ECHO_RE = re.compile(
-    r"^(?P<prefix>sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+))_echo-(?P<echo>\d+)_T1w\.nii\.gz$"
+    r"^(?P<prefix>sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+)"
+    r"(?:_(?!echo-)[A-Za-z0-9]+-[^_]+)*)_echo-(?P<echo>\d+)_T1w\.nii\.gz$"
 )
 
 
