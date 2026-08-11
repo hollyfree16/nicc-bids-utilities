@@ -4,8 +4,13 @@ Build mri_synthsr command queues for a BIDS dataset.
 
 Walks sub-*/ses-*/anat/ for combined (non-echo) T1w files matching:
     sub-<subject>_ses-<session>_T1w.nii.gz
+    sub-<subject>_ses-<session>_run-<n>_T1w.nii.gz
 
-and, for each session found, writes a queue file containing one
+For each subject/session, the run-free T1w is preferred if present;
+otherwise the lowest-numbered run-<n> T1w is used. At most one T1w is
+queued per subject/session.
+
+For each session found, writes a queue file containing one
 mri_synthsr command per subject:
 
     mri_synthsr --i <T1w> --o <synthsr-root>/ses-<session>/sub-<subject>/sub-<subject>_ses-<session>_T1w_synthsr.nii.gz
@@ -20,7 +25,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-T1W_RE = re.compile(r"^sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+)_T1w\.nii\.gz$")
+T1W_RE = re.compile(r"^sub-[^_]+_ses-[^_]+(?:_run-(?P<run>\d+))?_T1w\.nii\.gz$")
 
 
 def normalize_session(session: str) -> str:
@@ -34,6 +39,9 @@ def normalize_session(session: str) -> str:
 def find_t1w_images(bids_root: Path, session: str = None):
     """Find combined (non-echo) T1w images, grouped by session.
 
+    For each subject/session, the run-free T1w is preferred if present;
+    otherwise the lowest-numbered run-<n> T1w is used.
+
     Returns a dict mapping session label ("ses-Y") -> list of (subject, path)
     tuples, sorted by subject.
     """
@@ -41,10 +49,26 @@ def find_t1w_images(bids_root: Path, session: str = None):
 
     images = defaultdict(list)
     for anat_dir in sorted(bids_root.glob(f"sub-*/{session_glob}/anat")):
+        subject = anat_dir.parent.parent.name[len("sub-"):]
+        ses_label = anat_dir.parent.name
+
+        candidates = {}  # run number (or None for run-free) -> path
         for f in anat_dir.iterdir():
             m = T1W_RE.match(f.name)
             if m:
-                images[f"ses-{m.group('session')}"].append((m.group("subject"), f))
+                run = int(m.group("run")) if m.group("run") else None
+                candidates[run] = f
+        if not candidates:
+            continue
+
+        if None in candidates:
+            chosen = candidates[None]
+        else:
+            chosen_run = min(candidates)
+            chosen = candidates[chosen_run]
+            print(f"[info] sub-{subject} {ses_label}: no run-free T1w found, using run-{chosen_run:02d}")
+
+        images[ses_label].append((subject, chosen))
 
     for ses_label in images:
         images[ses_label].sort(key=lambda x: x[0])
