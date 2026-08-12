@@ -18,24 +18,31 @@ extensions (.dcm, .ima, none, etc):
                 and attempt to parse every non-DICOM file too, which is
                 much slower on a large tree.
 
-Four independent checks are run per study, from strictest to loosest:
+Four independent checks are run per study. Two rely only on already-parsed
+DICOM headers and always run; two require reading each file's full content
+and are opt-in, since on network-mounted storage every extra full-file read
+across thousands of files adds up fast:
 
-  1. exact_file_duplicate   - files are byte-for-byte identical (MD5 of raw file)
-  2. duplicate_sop_instance - the same SOPInstanceUID appears in more than one
-                               file. This UID should uniquely identify a single
-                               DICOM image - a repeat means the same instance
-                               was saved/copied more than once.
-  3. identical_pixel_data   - pixel data + key geometry are identical even
-                               though the file bytes/UIDs differ (e.g. a
-                               re-exported or re-anonymized copy of the same
-                               image). Requires pydicom.
-  4. duplicate_series       - two series in the same study share
-                               SeriesDescription/EchoTime/RepetitionTime/
-                               FlipAngle/instance count but have different
-                               SeriesInstanceUID - a whole series may have
-                               been duplicated or re-run. This is the loosest
-                               check and can include legitimate repeats (e.g.
-                               a scan re-run after motion) - review manually.
+  1. duplicate_sop_instance - (header-only, always on) the same SOPInstanceUID
+                               appears in more than one file. This UID should
+                               uniquely identify a single DICOM image - a
+                               repeat means the same instance was saved/copied
+                               more than once. Catches true duplicate copies
+                               just as reliably as a full byte hash would.
+  2. duplicate_series       - (header-only, always on) two series in the same
+                               study share SeriesDescription/EchoTime/
+                               RepetitionTime/FlipAngle/instance count but have
+                               different SeriesInstanceUID - a whole series may
+                               have been duplicated or re-run. This is the
+                               loosest check and can include legitimate
+                               repeats (e.g. a scan re-run after motion) -
+                               review manually.
+  3. exact_file_duplicate   - (--hash-bytes) files are byte-for-byte identical
+                               (MD5 of the raw file).
+  4. identical_pixel_data   - (--pixel-hash) pixel data + key geometry are
+                               identical even though the file bytes/UIDs
+                               differ (e.g. a re-exported or re-anonymized
+                               copy of the same image).
 
 Subjects are discovered as the immediate subdirectories of root_dir matching
 --subject (default 'sub-*'); each is scanned and reported on independently,
@@ -50,8 +57,8 @@ Usage:
     # further restrict to files matching a glob against the full path, e.g. one session
     python find_dicom_duplicates.py /path/to/sourcedata --subject "sub-MGHL2p*" --pattern "*ses-01*"
 
-    # skip the (slower) pixel-data content check
-    python find_dicom_duplicates.py /path/to/sourcedata --no-pixel-hash
+    # also run the slower full-file checks (exact bytes + pixel data)
+    python find_dicom_duplicates.py /path/to/sourcedata --hash-bytes --pixel-hash
 
     # also catch older/legacy DICOM files with no Part 10 preamble (slower)
     python find_dicom_duplicates.py /path/to/sourcedata --allow-headerless
@@ -68,6 +75,7 @@ import csv
 import fnmatch
 import hashlib
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -109,23 +117,27 @@ def find_candidate_files(root: Path, pattern: str = None):
         yield p
 
 
-def has_dicom_magic(path: Path) -> bool:
-    """Check for the Part-10 preamble + 'DICM' magic, regardless of extension."""
+def probe_dicom(path: Path, allow_headerless: bool):
+    """One file open: check the Part-10 magic, then parse the header (stopping
+    before pixel data) out of that same handle. Returns (has_magic, dataset_or_None).
+    Deliberately avoids reading pixel data here - that's the expensive part on
+    network storage, and is only needed for --pixel-hash."""
     try:
         with open(path, "rb") as f:
-            header = f.read(132)
-        return len(header) == 132 and header[128:132] == b"DICM"
+            preamble = f.read(132)
+            has_magic = len(preamble) == 132 and preamble[128:132] == b"DICM"
+            if not has_magic and not allow_headerless:
+                return False, None
+            f.seek(0)
+            try:
+                # force=True also lets this parse legacy files with no preamble;
+                # it's a no-op for well-formed files that do have one.
+                ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            except Exception:
+                ds = None
+            return has_magic, ds
     except OSError:
-        return False
-
-
-def read_dicom_header(path: Path):
-    """force=True lets this also parse legacy files with no Part 10 preamble;
-    it's a no-op for well-formed files that do have one."""
-    try:
-        return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
-    except Exception:
-        return None
+        return False, None
 
 
 def looks_like_dicom(ds) -> bool:
@@ -187,40 +199,48 @@ def scan_for_dicom(scan_dir: Path, pattern: str, allow_headerless: bool):
     n_checked = 0
     n_magic_hits = 0
     n_headerless_hits = 0
+    start = last_report = time.monotonic()
     for path in find_candidate_files(scan_dir, pattern):
         n_checked += 1
-        if has_dicom_magic(path):
+        has_magic, ds = probe_dicom(path, allow_headerless)
+        if has_magic:
             n_magic_hits += 1
-            ds = read_dicom_header(path)
-            if looks_like_dicom(ds):
-                dicom_files.append((path, ds))
-        elif allow_headerless:
-            ds = read_dicom_header(path)
-            if looks_like_dicom(ds):
+        if looks_like_dicom(ds):
+            if not has_magic:
                 n_headerless_hits += 1
-                dicom_files.append((path, ds))
-        if n_checked % 5000 == 0:
-            print(f"    ...checked {n_checked} files, {len(dicom_files)} DICOM so far", file=sys.stderr)
+            dicom_files.append((path, ds))
+
+        now = time.monotonic()
+        if now - last_report >= 3:
+            rate = n_checked / (now - start) if now > start else 0
+            print(f"    ...{n_checked} files checked ({rate:.1f}/s), "
+                  f"{len(dicom_files)} DICOM so far", file=sys.stderr)
+            last_report = now
     return dicom_files, n_checked, n_magic_hits, n_headerless_hits
 
 
-def run_duplicate_checks(dicom_files, no_pixel_hash: bool):
+def run_duplicate_checks(dicom_files, hash_bytes: bool, pixel_hash: bool):
     """dicom_files is a list of (path, pydicom Dataset). Returns a list of
-    {"type", "key", "files"} duplicate-group dicts."""
+    {"type", "key", "files"} duplicate-group dicts.
+
+    hash_bytes and pixel_hash both require re-reading each file's full
+    content from disk (headers alone aren't enough) - opt-in, since on
+    network storage that's drastically slower than the header-only checks."""
     results = []
 
-    # 1. exact file duplicate
-    hash_groups = defaultdict(list)
-    for path, ds in dicom_files:
-        try:
-            hash_groups[file_md5(path)].append(path)
-        except OSError as e:
-            print(f"    [WARN] could not hash {path}: {e}", file=sys.stderr)
-    for h, files in hash_groups.items():
-        if len(files) > 1:
-            results.append({"type": "exact_file_duplicate", "key": h, "files": [str(x) for x in files]})
+    # 1. exact file duplicate (opt-in: full-file MD5)
+    if hash_bytes:
+        hash_groups = defaultdict(list)
+        for path, ds in dicom_files:
+            try:
+                hash_groups[file_md5(path)].append(path)
+            except OSError as e:
+                print(f"    [WARN] could not hash {path}: {e}", file=sys.stderr)
+        for h, files in hash_groups.items():
+            if len(files) > 1:
+                results.append({"type": "exact_file_duplicate", "key": h, "files": [str(x) for x in files]})
 
-    # 2. duplicate SOPInstanceUID
+    # 2. duplicate SOPInstanceUID (header-only, cheap - always runs)
     sop_groups = defaultdict(list)
     for path, ds in dicom_files:
         sop_groups[str(ds.SOPInstanceUID)].append(path)
@@ -228,8 +248,8 @@ def run_duplicate_checks(dicom_files, no_pixel_hash: bool):
         if len(files) > 1 and not already_covered(files, results, {"exact_file_duplicate"}):
             results.append({"type": "duplicate_sop_instance", "key": uid, "files": [str(x) for x in files]})
 
-    # 3. identical pixel data
-    if not no_pixel_hash:
+    # 3. identical pixel data (opt-in: full-file read + pixel decode)
+    if pixel_hash:
         pixel_groups = defaultdict(list)
         for path, ds in dicom_files:
             ph = pixel_data_hash(path)
@@ -241,7 +261,8 @@ def run_duplicate_checks(dicom_files, no_pixel_hash: bool):
             ):
                 results.append({"type": "identical_pixel_data", "key": h, "files": [str(x) for x in files]})
 
-    # 4. duplicate series (same study + acquisition params, different SeriesInstanceUID)
+    # 4. duplicate series (header-only, cheap - always runs; same study +
+    # acquisition params, different SeriesInstanceUID)
     series_index = defaultdict(set)   # signature -> set of SeriesInstanceUID
     series_files = defaultdict(list)  # SeriesInstanceUID -> files
     for path, ds in dicom_files:
@@ -271,8 +292,17 @@ def main():
     parser.add_argument("--pattern", type=str, default=None,
                          help="Additionally restrict to files matching this glob against the "
                               "full path within each subject, e.g. '*ses-01*'")
-    parser.add_argument("--no-pixel-hash", action="store_true",
-                         help="Skip pixel-data hashing (faster, less thorough)")
+    parser.add_argument("--hash-bytes", action="store_true",
+                         help="Also compute a full-file MD5 per DICOM file to find byte-for-byte "
+                              "identical copies (exact_file_duplicate). Reads every file's full "
+                              "content - slow on network storage. Off by default: "
+                              "duplicate_sop_instance (header-only) already catches true "
+                              "duplicate copies just as reliably.")
+    parser.add_argument("--pixel-hash", action="store_true",
+                         help="Also hash pixel data + geometry to find images that are identical "
+                              "despite different file bytes/UIDs (identical_pixel_data), e.g. a "
+                              "re-exported or re-anonymized copy. Reads and decodes every file's "
+                              "full content - slow on network storage. Off by default.")
     parser.add_argument("--allow-headerless", action="store_true",
                          help="Also attempt to parse files with no Part 10 preamble/'DICM' "
                               "magic (older/legacy exports). Slower: every non-matching "
@@ -315,7 +345,7 @@ def main():
             continue
         any_dicom_found = True
 
-        results = run_duplicate_checks(dicom_files, args.no_pixel_hash)
+        results = run_duplicate_checks(dicom_files, args.hash_bytes, args.pixel_hash)
         if not results:
             print("  No potential duplicates found.\n")
         else:
