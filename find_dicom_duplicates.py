@@ -37,11 +37,18 @@ Four independent checks are run per study, from strictest to loosest:
                                check and can include legitimate repeats (e.g.
                                a scan re-run after motion) - review manually.
 
+Subjects are discovered as the immediate subdirectories of root_dir matching
+--subject (default 'sub-*'); each is scanned and reported on independently,
+so duplicate checks only compare files within the same subject.
+
 Usage:
     python find_dicom_duplicates.py /path/to/sourcedata
 
-    # only scan paths matching a glob (matched against the full path)
-    python find_dicom_duplicates.py /path/to/sourcedata --pattern "*sub-MGHL2p*"
+    # only scan subject directories matching a glob
+    python find_dicom_duplicates.py /path/to/sourcedata --subject "sub-MGHL2p*"
+
+    # further restrict to files matching a glob against the full path, e.g. one session
+    python find_dicom_duplicates.py /path/to/sourcedata --subject "sub-MGHL2p*" --pattern "*ses-01*"
 
     # skip the (slower) pixel-data content check
     python find_dicom_duplicates.py /path/to/sourcedata --no-pixel-hash
@@ -50,8 +57,10 @@ Usage:
     python find_dicom_duplicates.py /path/to/sourcedata --allow-headerless
 
 Output:
-    - Console summary of all duplicate groups found
-    - CSV report (default: dicom_duplicate_report.csv)
+    - Console: "Scanning <subject path> ..." followed by a per-subject summary
+      of any duplicate groups found, printed as each subject finishes
+    - CSV report (default: dicom_duplicate_report.csv), one row per duplicate
+      group across all subjects
 """
 
 import argparse
@@ -168,65 +177,36 @@ def already_covered(files, results, types):
     return any(fset == set(r["files"]) for r in results if r["type"] in types)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Find potential duplicate DICOM files/series in a raw sourcedata directory.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("root_dir", type=str, help="Path to scan (e.g. sourcedata/)")
-    parser.add_argument("--pattern", type=str, default=None,
-                         help="Only consider paths matching this glob against the full path, "
-                              "e.g. '*sub-MGHL2p*'")
-    parser.add_argument("--no-pixel-hash", action="store_true",
-                         help="Skip pixel-data hashing (faster, less thorough)")
-    parser.add_argument("--allow-headerless", action="store_true",
-                         help="Also attempt to parse files with no Part 10 preamble/'DICM' "
-                              "magic (older/legacy exports). Slower: every non-matching "
-                              "candidate file gets a parse attempt.")
-    parser.add_argument("--out", type=str, default="dicom_duplicate_report.csv",
-                         help="Output CSV path (default: dicom_duplicate_report.csv)")
-    args = parser.parse_args()
+def find_subject_dirs(root: Path, subject_pattern: str):
+    return sorted(p for p in root.glob(subject_pattern) if p.is_dir())
 
-    if not HAVE_PYDICOM:
-        sys.exit("ERROR: pydicom is required for this script. Install with: pip install pydicom")
 
-    root = Path(args.root_dir).expanduser().resolve()
-    if not root.is_dir():
-        sys.exit(f"ERROR: {root} is not a directory")
-
-    print(f"Scanning {root} for DICOM files (identified by content, not extension)...")
-
-    dicom_files = []  # list of (path, dataset)
+def scan_for_dicom(scan_dir: Path, pattern: str, allow_headerless: bool):
+    """Walk scan_dir and return (dicom_files, n_checked, n_magic_hits, n_headerless_hits)."""
+    dicom_files = []
     n_checked = 0
     n_magic_hits = 0
     n_headerless_hits = 0
-    for path in find_candidate_files(root, args.pattern):
+    for path in find_candidate_files(scan_dir, pattern):
         n_checked += 1
         if has_dicom_magic(path):
             n_magic_hits += 1
             ds = read_dicom_header(path)
             if looks_like_dicom(ds):
                 dicom_files.append((path, ds))
-        elif args.allow_headerless:
+        elif allow_headerless:
             ds = read_dicom_header(path)
             if looks_like_dicom(ds):
                 n_headerless_hits += 1
                 dicom_files.append((path, ds))
         if n_checked % 5000 == 0:
-            print(f"  ...checked {n_checked} files, {len(dicom_files)} DICOM so far", file=sys.stderr)
+            print(f"    ...checked {n_checked} files, {len(dicom_files)} DICOM so far", file=sys.stderr)
+    return dicom_files, n_checked, n_magic_hits, n_headerless_hits
 
-    print(f"Checked {n_checked} candidate files ({n_magic_hits} had DICOM magic bytes, "
-          f"{n_headerless_hits} recovered as headerless legacy DICOM), "
-          f"{len(dicom_files)} parsed as valid DICOM instances.")
-    if not dicom_files:
-        if args.allow_headerless:
-            sys.exit("No DICOM files found under the given path/pattern.")
-        sys.exit(
-            "No DICOM files found via the Part 10 magic-byte check. If some of your files "
-            "predate that standard or had the preamble stripped, re-run with --allow-headerless."
-        )
 
+def run_duplicate_checks(dicom_files, no_pixel_hash: bool):
+    """dicom_files is a list of (path, pydicom Dataset). Returns a list of
+    {"type", "key", "files"} duplicate-group dicts."""
     results = []
 
     # 1. exact file duplicate
@@ -235,7 +215,7 @@ def main():
         try:
             hash_groups[file_md5(path)].append(path)
         except OSError as e:
-            print(f"  [WARN] could not hash {path}: {e}", file=sys.stderr)
+            print(f"    [WARN] could not hash {path}: {e}", file=sys.stderr)
     for h, files in hash_groups.items():
         if len(files) > 1:
             results.append({"type": "exact_file_duplicate", "key": h, "files": [str(x) for x in files]})
@@ -249,7 +229,7 @@ def main():
             results.append({"type": "duplicate_sop_instance", "key": uid, "files": [str(x) for x in files]})
 
     # 3. identical pixel data
-    if not args.no_pixel_hash:
+    if not no_pixel_hash:
         pixel_groups = defaultdict(list)
         for path, ds in dicom_files:
             ph = pixel_data_hash(path)
@@ -274,22 +254,100 @@ def main():
             files = sorted(set(f for uid in series_uids for f in series_files[uid]))
             results.append({"type": "duplicate_series", "key": " | ".join(sig), "files": [str(x) for x in files]})
 
-    if not results:
-        print("\nNo potential duplicates found.")
-    else:
-        print(f"\nFound {len(results)} potential duplicate group(s):\n")
-        for r in results:
-            print(f"[{r['type']}]")
-            for f in r["files"]:
-                print(f"    - {f}")
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find potential duplicate DICOM files/series in a raw sourcedata directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("root_dir", type=str, help="Path to scan (e.g. sourcedata/)")
+    parser.add_argument("--subject", type=str, default=None,
+                         help="Subject glob matched against immediate subdirectories of "
+                              "root_dir, e.g. 'sub-MGHL2p*' (default: 'sub-*', falling back to "
+                              "treating root_dir itself as a single subject if nothing matches)")
+    parser.add_argument("--pattern", type=str, default=None,
+                         help="Additionally restrict to files matching this glob against the "
+                              "full path within each subject, e.g. '*ses-01*'")
+    parser.add_argument("--no-pixel-hash", action="store_true",
+                         help="Skip pixel-data hashing (faster, less thorough)")
+    parser.add_argument("--allow-headerless", action="store_true",
+                         help="Also attempt to parse files with no Part 10 preamble/'DICM' "
+                              "magic (older/legacy exports). Slower: every non-matching "
+                              "candidate file gets a parse attempt.")
+    parser.add_argument("--out", type=str, default="dicom_duplicate_report.csv",
+                         help="Output CSV path (default: dicom_duplicate_report.csv)")
+    args = parser.parse_args()
+
+    if not HAVE_PYDICOM:
+        sys.exit("ERROR: pydicom is required for this script. Install with: pip install pydicom")
+
+    root = Path(args.root_dir).expanduser().resolve()
+    if not root.is_dir():
+        sys.exit(f"ERROR: {root} is not a directory")
+
+    subject_pattern = args.subject or "sub-*"
+    subj_dirs = find_subject_dirs(root, subject_pattern)
+    if not subj_dirs:
+        if args.subject is None:
+            subj_dirs = [root]  # no sub-* layout - treat root itself as one subject
+        else:
+            sys.exit(f"No subject directories matched '{args.subject}' under {root}")
+
+    print(f"Found {len(subj_dirs)} subject director{'y' if len(subj_dirs) == 1 else 'ies'} "
+          f"matching '{subject_pattern}'\n")
+
+    all_results = []
+    any_dicom_found = False
+    for subj_dir in subj_dirs:
+        print(f"Scanning {subj_dir} ...")
+        dicom_files, n_checked, n_magic, n_headerless = scan_for_dicom(
+            subj_dir, args.pattern, args.allow_headerless
+        )
+        print(f"  checked {n_checked} candidate files ({n_magic} DICOM magic-byte hits"
+              + (f", {n_headerless} headerless" if args.allow_headerless else "")
+              + f"), {len(dicom_files)} parsed as valid DICOM instances")
+
+        if not dicom_files:
+            print("  No DICOM files found for this subject.\n")
+            continue
+        any_dicom_found = True
+
+        results = run_duplicate_checks(dicom_files, args.no_pixel_hash)
+        if not results:
+            print("  No potential duplicates found.\n")
+        else:
+            print(f"  Found {len(results)} potential duplicate group(s):")
+            for r in results:
+                print(f"    [{r['type']}]")
+                for f in r["files"]:
+                    print(f"        - {f}")
             print()
+
+        for r in results:
+            r["subject"] = subj_dir.name
+        all_results.extend(results)
+
+    if not any_dicom_found:
+        if args.allow_headerless:
+            sys.exit("No DICOM files found under the given path/subject/pattern.")
+        sys.exit(
+            "No DICOM files found via the Part 10 magic-byte check in any subject. If some of "
+            "your files predate that standard or had the preamble stripped, re-run with "
+            "--allow-headerless."
+        )
+
+    print(f"{'=' * 60}\nTOTAL: {len(all_results)} potential duplicate group(s) "
+          f"across {len(subj_dirs)} subject(s).")
 
     out_path = Path(args.out)
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["duplicate_type", "signature_key", "files"])
-        for r in results:
-            writer.writerow([r["type"], r["key"], " ;; ".join(r["files"])])
+        writer.writerow(["subject", "duplicate_type", "signature_key", "files"])
+        for r in all_results:
+            writer.writerow([r["subject"], r["type"], r["key"], " ;; ".join(r["files"])])
     print(f"Report written to: {out_path.resolve()}")
 
 
