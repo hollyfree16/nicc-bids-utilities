@@ -123,7 +123,8 @@ def find_subject_dir(root: Path, sites: list[str], subject_id: str) -> Path | No
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, type=Path,
-                     help="Input CSV with columns: subject-id, session-id, etiv (no header assumed)")
+                     help="Input CSV with columns: subject-id, session-id, etiv, [...extra] "
+                          "(no header assumed; any columns beyond etiv are passed through unchanged)")
     ap.add_argument("--root", required=True, type=Path,
                      help="raw/mri root containing site subfolders (IU, UW, MSSM, MGH, ...)")
     ap.add_argument("--sites", nargs="+", default=["IU", "UW", "MSSM", "MGH"],
@@ -146,12 +147,15 @@ def main():
     with open(args.input, newline="") as fin, open(args.output, "w", newline="") as fout:
         reader = csv.reader(fin)
         writer = csv.writer(fout)
-        writer.writerow(["subject-id", "session-id", "etiv", "scan-date"])
-        fout.flush()
 
         rows = list(reader)
+        extra_names = []
         if args.has_header and rows:
+            extra_names = [h.strip() for h in rows[0][3:]]
             rows = rows[1:]
+
+        writer.writerow(["subject-id", "session-id", "etiv", "scan-date", *extra_names])
+        fout.flush()
 
         total = len(rows)
         for i, row in enumerate(rows, start=1):
@@ -159,6 +163,7 @@ def main():
                 print(f"[WARN] skipping malformed row: {row}", file=sys.stderr)
                 continue
             subject_id, session_id, etiv = row[0].strip(), row[1].strip(), row[2].strip()
+            extra = row[3:]
 
             subject_dir = find_subject_dir(args.root, args.sites, subject_id)
             if subject_dir is None:
@@ -173,7 +178,7 @@ def main():
                     scan_date = date if date else "NO_DATE"
 
             print(f"[SCAN] {subject_id} {session_id} -> {scan_date}", file=sys.stderr)
-            writer.writerow([subject_id, session_id, etiv, scan_date])
+            writer.writerow([subject_id, session_id, etiv, scan_date, *extra])
             fout.flush()  # visible to `tail -f`, safe if interrupted
 
             if i % 25 == 0 or i == total:
