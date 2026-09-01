@@ -12,10 +12,12 @@ used per subject/session (same selection logic as format_synthsr_batch.py).
 
 For each T1w found, the volume is reoriented to canonical (RAS+) so that
 axis 2 is the axial (superior-inferior) axis, the center axial slice is
-taken as the geometric middle of that axis, and --num-slices slices are
-sampled evenly spaced across [center - --offset, center + --offset]
-(e.g. center=45, offset=20 -> slices spread across 25-65). Slices are
-tiled into a single PNG mosaic:
+taken as the geometric middle of that axis, and slices are sampled across
+[center - --offset, center + --offset] (e.g. center=45, offset=20 ->
+range 25-65): either --num-slices slices evenly spaced across that range
+(default 40), or, if --stride is given, every stride-th slice instead
+(e.g. --stride 2 for every other slice). Slices are tiled into a single
+PNG mosaic:
 
     <output-dir>/ses-<session>/sub-<subject>_ses-<session>_T1w_mosaic.png
 
@@ -89,17 +91,24 @@ def find_t1w_images(bids_root: Path, session: str = None):
     return images
 
 
-def pick_slices(center: int, offset: int, num_slices: int, n_total: int) -> list:
-    """--num-slices indices evenly spaced across [center-offset, center+offset],
-    clipped to valid range and de-duplicated (rounding can collide neighbors)."""
+def pick_slices(center: int, offset: int, n_total: int, num_slices: int = None, stride: int = None) -> list:
+    """Indices across [center-offset, center+offset], clipped to valid range and
+    de-duplicated (rounding can collide neighbors).
+
+    If stride is given, takes every stride-th slice (e.g. stride=2 -> every other
+    slice). Otherwise takes num_slices indices evenly spaced across the range.
+    """
     lo, hi = center - offset, center + offset
-    raw = np.linspace(lo, hi, num_slices)
+    if stride:
+        raw = np.arange(lo, hi + 1, stride)
+    else:
+        raw = np.linspace(lo, hi, num_slices)
     idx = np.unique(np.round(raw).astype(int))
     idx = idx[(idx >= 0) & (idx < n_total)]
     return idx.tolist()
 
 
-def build_mosaic(t1w_path: Path, out_path: Path, offset: int, num_slices: int, cols: int) -> int:
+def build_mosaic(t1w_path: Path, out_path: Path, offset: int, num_slices: int, stride: int, cols: int) -> int:
     """Builds the mosaic PNG at out_path. Returns the number of slices used."""
     img = nib.load(str(t1w_path))
     canon = nib.as_closest_canonical(img)  # axis 2 becomes the axial (S-I) axis
@@ -107,7 +116,7 @@ def build_mosaic(t1w_path: Path, out_path: Path, offset: int, num_slices: int, c
 
     n_axial = data.shape[2]
     center = n_axial // 2
-    slice_idxs = pick_slices(center, offset, num_slices, n_axial)
+    slice_idxs = pick_slices(center, offset, n_axial, num_slices=num_slices, stride=stride)
     if not slice_idxs:
         print(f"[warn] {t1w_path}: no valid axial slices in range, skipping")
         return 0
@@ -149,8 +158,14 @@ def main():
     parser.add_argument("--session", help="Restrict to a single session, e.g. --session 1 or --session ses-001")
     parser.add_argument("--offset", type=int, default=20,
                          help="Slices span [center-offset, center+offset] (default: 20)")
-    parser.add_argument("--num-slices", type=int, default=40,
-                         help="Number of slices evenly spaced across that range (default: 40)")
+    count_group = parser.add_mutually_exclusive_group()
+    count_group.add_argument("--num-slices", type=int, default=40,
+                              help="Number of slices evenly spaced across that range (default: 40). "
+                                   "Ignored if --stride is given.")
+    count_group.add_argument("--stride", type=int,
+                              help="Take every stride-th slice across the range instead of a fixed "
+                                   "count, e.g. --stride 2 for every other slice, --stride 3 for "
+                                   "every 3rd slice. Overrides --num-slices.")
     parser.add_argument("--cols", type=int, default=8,
                          help="Number of mosaic grid columns (default: 8)")
     args = parser.parse_args()
@@ -175,7 +190,7 @@ def main():
                 print(f"[skip] {out_path} already exists")
                 continue
 
-            n = build_mosaic(t1w_path, out_path, args.offset, args.num_slices, args.cols)
+            n = build_mosaic(t1w_path, out_path, args.offset, args.num_slices, args.stride, args.cols)
             if n:
                 print(f"[mosaic] {out_path} ({n} slices)")
                 total_built += 1
