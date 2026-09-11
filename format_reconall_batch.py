@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Build recon-all command queues from a SynthSR output directory.
+Build recon-all command queues from a SynthSR output directory or a BIDS root.
 
-Walks ses-*/sub-*/ under a SynthSR output directory (as produced by
-format_synthsr_batch.py) for synthesized T1w images matching:
+With --synthsr-root, walks ses-*/sub-*/ under a SynthSR output directory (as
+produced by format_synthsr_batch.py) for synthesized T1w images matching:
     sub-<subject>_ses-<session>_T1w_synthsr.nii.gz
 
-and, for each session found, writes a queue file containing one
-recon-all command per subject:
+With --bids-root, walks sub-*/ses-*/anat/ under a BIDS dataset root (same
+layout as average_echoes.py) for T1w images matching:
+    sub-<subject>_ses-<session>[_<other entities>]_T1w.nii.gz
+(echo-<n> files are excluded, so an averaged multi-echo output produced by
+average_echoes.py is picked up correctly).
 
-    recon-all -i <synthsr T1w> -s sub-<subject> -sd <sd-root>/ses-<session> -all
+For each session found, writes a queue file containing one recon-all command
+per subject:
+
+    recon-all -i <T1w> -s sub-<subject> -sd <sd-root>/ses-<session> -all
 
 Queue files are named "<session>_recon-all_queue.txt" and written to
 --output-dir. Subjects whose directory already exists under
@@ -22,6 +28,10 @@ from collections import defaultdict
 from pathlib import Path
 
 SYNTHSR_RE = re.compile(r"^sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+)_T1w_synthsr\.nii\.gz$")
+BIDS_RE = re.compile(
+    r"^sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+)"
+    r"(?:_(?!echo-)[A-Za-z0-9]+-[^_]+)*_T1w\.nii\.gz$"
+)
 
 
 def normalize_session(session: str) -> str:
@@ -53,6 +63,27 @@ def find_synthsr_images(synthsr_root: Path, session: str = None):
     return images
 
 
+def find_bids_images(bids_root: Path, session: str = None):
+    """Find BIDS T1w images, grouped by session.
+
+    Returns a dict mapping session label ("ses-Y") -> list of (subject, path)
+    tuples, sorted by subject.
+    """
+    session_glob = normalize_session(session) if session else "ses-*"
+
+    images = defaultdict(list)
+    for anat_dir in sorted(bids_root.glob(f"sub-*/{session_glob}/anat")):
+        for f in anat_dir.iterdir():
+            m = BIDS_RE.match(f.name)
+            if m:
+                images[f"ses-{m.group('session')}"].append((m.group("subject"), f))
+
+    for ses_label in images:
+        images[ses_label].sort(key=lambda x: x[0])
+
+    return images
+
+
 def build_command(subject, ses_label, t1w_path: Path, sd_root: Path) -> str:
     subjid = f"sub-{subject}"
     sd = sd_root / ses_label
@@ -68,8 +99,13 @@ def build_command(subject, ses_label, t1w_path: Path, sd_root: Path) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("synthsr_root", type=Path, help="Path to the SynthSR output directory, e.g. "
-                                                          "/.../derivatives/synthsr")
+    root_group = parser.add_mutually_exclusive_group(required=True)
+    root_group.add_argument("--synthsr-root", type=Path,
+                             help="Path to a SynthSR output directory, e.g. /.../derivatives/synthsr "
+                                  "(expects ses-*/sub-*/sub-<s>_ses-<n>_T1w_synthsr.nii.gz)")
+    root_group.add_argument("--bids-root", type=Path,
+                             help="Path to a BIDS dataset root, e.g. /.../rawdata "
+                                  "(expects sub-*/ses-*/anat/sub-<s>_ses-<n>_T1w.nii.gz)")
     parser.add_argument("--sd-root", type=Path, required=True,
                          help="Base FreeSurfer subjects directory, e.g. /.../derivatives/freesurfer_reconall_v8.2.0 "
                               "(a ses-<session> subdirectory is appended automatically)")
@@ -78,17 +114,25 @@ def main():
     parser.add_argument("--session", help="Restrict to a single session, e.g. --session 1 or --session ses-001")
     args = parser.parse_args()
 
-    synthsr_root = args.synthsr_root.resolve()
-    if not synthsr_root.is_dir():
-        parser.error(f"{synthsr_root} is not a directory")
+    if args.synthsr_root:
+        input_root = args.synthsr_root.resolve()
+        source_label = "SynthSR"
+        find_images = find_synthsr_images
+    else:
+        input_root = args.bids_root.resolve()
+        source_label = "BIDS"
+        find_images = find_bids_images
+
+    if not input_root.is_dir():
+        parser.error(f"{input_root} is not a directory")
 
     sd_root = args.sd_root.resolve()
     output_dir = args.output_dir.resolve()
 
-    images_by_session = find_synthsr_images(synthsr_root, args.session)
+    images_by_session = find_images(input_root, args.session)
     if not images_by_session:
         scope = f" for {normalize_session(args.session)}" if args.session else ""
-        print(f"No SynthSR T1w images found under {synthsr_root}{scope}")
+        print(f"No {source_label} T1w images found under {input_root}{scope}")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
