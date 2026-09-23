@@ -46,7 +46,7 @@ them would silently introduce error, so the script never does.
    `SUBJECTS_DIR/<subject>/label/{lh,rh}.Schaefer2018_1000Parcels_7Networks_order.annot`.
    Skipped if the annotation already exists, unless `--overwrite` is given.
 4. **Build a subject-native volumetric Schaefer segmentation** with
-   `mri_aparc2aseg --ribbon`, written to
+   `mri_aparc2aseg --new-ribbon`, written to
    `SUBJECTS_DIR/<subject>/mri/Schaefer2018_1000Parcels_7Networks_order.mgz`.
    This is the single reference grid for every calculation below. Standard
    `recon-all` outputs (`aparc+aseg.mgz`, `aseg.mgz`, `brainmask.mgz`, etc.)

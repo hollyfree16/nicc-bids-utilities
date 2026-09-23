@@ -265,7 +265,7 @@ def build_schaefer_volume(paths: SubjectPaths, subject: str, overwrite: bool, en
         "mri_aparc2aseg",
         "--s", subject,
         "--annot", ATLAS_BASENAME,
-        "--ribbon",
+        "--new-ribbon",
         "--o", str(paths.schaefer_vol),
     ]
     run_fs(cmd, env, paths.log_file, "Schaefer volume creation")
