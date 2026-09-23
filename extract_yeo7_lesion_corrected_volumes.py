@@ -345,10 +345,44 @@ def geometries_match(img_a, img_b, atol: float = GEOM_ATOL) -> bool:
     )
 
 
+def _describe_geometry(label: str, path: Path, img) -> str:
+    zooms = img.header.get_zooms()[:3]
+    affine_str = "\n".join("    " + "  ".join(f"{v: .4f}" for v in row) for row in np.asarray(img.affine))
+    return (
+        f"  {label}: {path}\n"
+        f"    shape       = {img.shape[:3]}\n"
+        f"    voxel size  = {tuple(round(float(z), 4) for z in zooms)} mm\n"
+        f"    affine      =\n{affine_str}"
+    )
+
+
+def geometry_diff_report(lesion_path: Path, lesion_img, schaefer_path: Path, schaefer_img,
+                          orig_path: Optional[Path] = None) -> str:
+    """Human-readable dump comparing lesion / Schaefer (/ orig.mgz) geometry, so failures
+    are self-diagnosing without re-running mri_info by hand."""
+    lines = [
+        "Geometry comparison (equivalent to running `mri_info` on each of these):",
+        _describe_geometry("lesion", lesion_path, lesion_img),
+        _describe_geometry("Schaefer/FreeSurfer target", schaefer_path, schaefer_img),
+    ]
+    if orig_path is not None and orig_path.is_file():
+        try:
+            orig_img = nib.load(str(orig_path))
+            lines.append(_describe_geometry("recon-all orig.mgz (reference T1)", orig_path, orig_img))
+            same_as_orig = geometries_match(lesion_img, orig_img)
+            lines.append(
+                f"  -> lesion grid {'MATCHES' if same_as_orig else 'does NOT match'} orig.mgz "
+                f"({'likely just needs --lesion-native-header' if same_as_orig else 'likely a genuinely different coordinate system (e.g. MNI/FLAIR/CT) -- needs a real --lesion-xfm-pattern transform'})."
+            )
+        except Exception:  # noqa: BLE001 - best-effort diagnostic only
+            pass
+    return "\n".join(lines)
+
+
 def prepare_lesion_volume(subject: str, lesion_path: Path, schaefer_path: Path, out_path: Path,
                            lesion_xfm_pattern: Optional[str], lesion_xfm_type: str,
                            lesion_native_header: bool, env: dict, log_file: Path,
-                           warnings: list[str]) -> Path:
+                           warnings: list[str], orig_path: Optional[Path] = None) -> Path:
     lesion_img = nib.load(str(lesion_path))
     target_img = nib.load(str(schaefer_path))
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,19 +420,28 @@ def prepare_lesion_volume(subject: str, lesion_path: Path, schaefer_path: Path, 
             "recon-all T1) -- visually QC the overlay before trusting these numbers."
         )
     else:
+        report = geometry_diff_report(lesion_path, lesion_img, schaefer_path, target_img, orig_path)
+        diag_path = out_path.parent / "lesion_geometry_diagnostic.txt"
+        diag_path.write_text(report + "\n")
         raise SubjectStageError(
             "lesion registration",
             "Lesion geometry (shape/affine) does not match the subject's Schaefer/FreeSurfer volume, "
             "and no --lesion-xfm-pattern or --lesion-native-header was supplied. Refusing to guess a "
-            "registration between potentially unrelated coordinate systems (e.g. MNI vs. native).",
+            "registration between potentially unrelated coordinate systems (e.g. MNI vs. native). "
+            f"Full comparison saved to {diag_path}.",
+            stderr=report,
         )
 
     resampled_img = nib.load(str(out_path))
     if not geometries_match(resampled_img, target_img):
+        report = geometry_diff_report(lesion_path, lesion_img, schaefer_path, target_img, orig_path)
+        diag_path = out_path.parent / "lesion_geometry_diagnostic.txt"
+        diag_path.write_text(report + "\n")
         raise SubjectStageError(
             "lesion registration",
             f"Resampled lesion grid still does not match the Schaefer volume grid "
-            f"(shape {resampled_img.shape[:3]} vs {target_img.shape[:3]}).",
+            f"(shape {resampled_img.shape[:3]} vs {target_img.shape[:3]}). Full comparison saved to {diag_path}.",
+            stderr=report,
         )
     return out_path
 
@@ -466,7 +509,7 @@ def process_subject(subject: str, cfg: dict) -> dict:
         prepare_lesion_volume(
             subject, lesion_path, paths.schaefer_vol, intermediate_lesion_path,
             cfg["lesion_xfm_pattern"], cfg["lesion_xfm_type"], cfg["lesion_native_header"],
-            env, paths.log_file, warnings,
+            env, paths.log_file, warnings, orig_path=paths.subj_dir / "mri" / "orig.mgz",
         )
         lesion_img = nib.load(str(intermediate_lesion_path))
         lesion_data = np.asarray(lesion_img.dataobj, dtype=np.float64)
@@ -638,6 +681,8 @@ def process_subject(subject: str, cfg: dict) -> dict:
 
     except SubjectStageError as exc:
         log.error("[%s] FAILED at stage '%s': %s", subject, exc.stage, exc.reason)
+        if exc.stderr:
+            log.error("[%s] details:\n%s", subject, exc.stderr)
         return {
             "status": "failed", "subject": subject, "stage": exc.stage,
             "reason": exc.reason, "stderr": exc.stderr,
